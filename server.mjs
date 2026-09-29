@@ -375,7 +375,7 @@ async function handle(req, res) {
   }
 }
 
-createServer(handle).listen(port, '127.0.0.1', () => {
+createServer(handle).listen(port, '0.0.0.0', () => {
   console.info(`GoRide is running at http://127.0.0.1:${port}`);
   console.info(`Database: ${join(dataDir, 'goride.sqlite')}`);
   if (mode !== 'production') console.info('Development OTP mode is enabled; OTPs are logged to this terminal.');

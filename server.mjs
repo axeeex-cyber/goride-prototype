@@ -361,8 +361,9 @@ async function handle(req, res) {
   if (req.method !== 'GET' && req.method !== 'HEAD') return json(res, 405, { error: 'Method not allowed.' });
   const requested = pathname === '/' ? '/index.html' : pathname === '/admin' ? '/admin.html' : decodeURIComponent(pathname);
   const relative = normalize(requested).replace(/^([/\\]|\.\.(?:[/\\]|$))+/, '');
-  const file = join(root, 'public', relative);
-  if (!file.startsWith(join(root, 'public'))) return json(res, 403, { error: 'Forbidden.' });
+  if (relative.split(/[\\/]/).some(segment => segment.startsWith('.'))) return json(res, 404, { error: 'Not found.' });
+  const file = join(root, relative);
+  if (!file.startsWith(root)) return json(res, 403, { error: 'Forbidden.' });
   try {
     const content = await readFile(file);
     const type = file.endsWith('.html') ? 'text/html; charset=utf-8' : 'application/octet-stream';

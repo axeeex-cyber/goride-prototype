@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: goride-prototype
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: 22.11.0
+      - key: OTP_SECRET
+        generateValue: true
+      - key: GOOGLE_MAPS_API_KEY
+        sync: false

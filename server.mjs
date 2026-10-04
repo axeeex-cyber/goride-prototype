@@ -189,7 +189,7 @@ const insertGeofence = db.prepare('INSERT OR IGNORE INTO geofences (zone, label,
 for (const geofence of geofenceDefaults) insertGeofence.run(...geofence);
 
 function currentGeofences() {
-  return db.prepare('SELECT zone, label, north, south, west, east, color FROM geofences ORDER BY CASE zone WHEN 'male' THEN 1 WHEN 'airport' THEN 2 WHEN 'phase1' THEN 3 WHEN 'phase2' THEN 4 ELSE 99 END').all();
+  return db.prepare("SELECT zone, label, north, south, west, east, color FROM geofences ORDER BY CASE zone WHEN 'male' THEN 1 WHEN 'airport' THEN 2 WHEN 'phase1' THEN 3 WHEN 'phase2' THEN 4 ELSE 99 END").all();
 }
 
 function mapPointZone(latitude, longitude) {

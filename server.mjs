@@ -70,6 +70,12 @@ db.exec(`
     base_fare REAL NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1))
   );
+  CREATE TABLE IF NOT EXISTS fare_rules (
+    route_key TEXT NOT NULL,
+    ride_type_id INTEGER NOT NULL REFERENCES ride_types(id) ON DELETE CASCADE,
+    price REAL NOT NULL CHECK (price > 0),
+    PRIMARY KEY (route_key, ride_type_id)
+  );
 `);
 
 if (!db.prepare("SELECT 1 FROM pragma_table_info('ride_types') WHERE name = 'icon'").get()) {
@@ -154,17 +160,44 @@ function fareZone(value) {
   return 'local';
 }
 
-function zoneFare(pickup, destination, seats, fallbackFare) {
+const fareRoutes = [
+  ['local', 'Within the same zone'],
+  ['malePhase1', 'Malé ↔ Hulhumalé Phase 1'],
+  ['malePhase2', 'Malé ↔ Hulhumalé Phase 2'],
+  ['phase1Phase2', 'Hulhumalé Phase 1 ↔ Phase 2'],
+  ['airportMale', 'Airport (VIA) ↔ Malé'],
+  ['airportPhase1', 'Airport (VIA) ↔ Hulhumalé Phase 1'],
+  ['airportPhase2', 'Airport (VIA) ↔ Hulhumalé Phase 2']
+];
+
+function fareRouteKey(pickup, destination) {
   const from = fareZone(pickup), to = fareZone(destination);
   const pair = new Set([from, to]);
-  let key = 'local';
-  if (pair.has('airport')) key = pair.has('male') ? 'airportMale' : pair.has('phase2') ? 'airportPhase2' : pair.has('phase1') ? 'airportPhase1' : 'local';
-  else if (pair.has('male') && pair.has('phase2')) key = 'malePhase2';
-  else if (pair.has('male') && pair.has('phase1')) key = 'malePhase1';
-  else if (pair.has('phase1') && pair.has('phase2')) key = 'phase1Phase2';
-  const column = Number(seats) >= 7 ? 1 : 0;
-  return { fare: fareTable[key]?.[column] ?? fallbackFare, zone: key };
+  if (pair.has('airport')) return pair.has('male') ? 'airportMale' : pair.has('phase2') ? 'airportPhase2' : pair.has('phase1') ? 'airportPhase1' : 'local';
+  if (pair.has('male') && pair.has('phase2')) return 'malePhase2';
+  if (pair.has('male') && pair.has('phase1')) return 'malePhase1';
+  if (pair.has('phase1') && pair.has('phase2')) return 'phase1Phase2';
+  return 'local';
 }
+
+function defaultFare(routeKey, seats, fallbackFare) {
+  if (routeKey === 'local') return fallbackFare;
+  const column = Number(seats) >= 7 ? 1 : 0;
+  return fareTable[routeKey]?.[column] ?? fallbackFare;
+}
+
+function ensureFareRules(rideType) {
+  const insert = db.prepare('INSERT OR IGNORE INTO fare_rules (route_key, ride_type_id, price) VALUES (?, ?, ?)');
+  for (const [routeKey] of fareRoutes) insert.run(routeKey, rideType.id, defaultFare(routeKey, rideType.seats, rideType.baseFare));
+}
+
+function zoneFare(pickup, destination, seats, fallbackFare, rideTypeId) {
+  const zone = fareRouteKey(pickup, destination);
+  const saved = Number.isInteger(Number(rideTypeId)) ? db.prepare('SELECT price FROM fare_rules WHERE route_key = ? AND ride_type_id = ?').get(zone, Number(rideTypeId)) : null;
+  return { fare: saved?.price ?? defaultFare(zone, seats, fallbackFare), zone };
+}
+
+for (const rideType of db.prepare('SELECT id, seats, base_fare AS baseFare FROM ride_types').all()) ensureFareRules(rideType);
 
 function json(res, status, value) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
@@ -234,14 +267,35 @@ async function handleApi(req, res, pathname) {
     const pickup = String(params.get('pickup') || '').trim();
     const destination = String(params.get('destination') || '').trim();
     const seats = Number(params.get('seats'));
+    const rideTypeId = Number(params.get('rideTypeId'));
     if (!pickup || !destination || !Number.isInteger(seats)) return json(res, 400, { error: 'Pickup, destination, and vehicle seats are required.' });
-    const quote = zoneFare(pickup, destination, seats, seats >= 7 ? 45 : 30);
+    const quote = zoneFare(pickup, destination, seats, seats >= 7 ? 45 : 30, Number.isInteger(rideTypeId) ? rideTypeId : undefined);
     return json(res, 200, quote);
   }
 
   if (req.method === 'GET' && pathname === '/api/admin/ride-types') {
     const rideTypes = db.prepare('SELECT id, name, icon, seats, eta_minutes AS etaMinutes, base_fare AS baseFare, enabled FROM ride_types ORDER BY id').all();
     return json(res, 200, { rideTypes });
+  }
+
+  if (req.method === 'GET' && pathname === '/api/admin/fare-rules') {
+    const rideTypes = db.prepare('SELECT id, name, icon, seats, base_fare AS baseFare FROM ride_types ORDER BY id').all();
+    for (const rideType of rideTypes) ensureFareRules(rideType);
+    const prices = db.prepare('SELECT route_key AS routeKey, ride_type_id AS rideTypeId, price FROM fare_rules').all();
+    return json(res, 200, { routes: fareRoutes.map(([key, label]) => ({ key, label })), rideTypes, prices });
+  }
+
+  if (req.method === 'PATCH' && pathname === '/api/admin/fare-rules') {
+    const body = await getBody(req);
+    const routeKey = String(body.routeKey || '');
+    const rideTypeId = Number(body.rideTypeId), price = Number(body.price);
+    if (!fareRoutes.some(([key]) => key === routeKey) || !Number.isInteger(rideTypeId) || !Number.isFinite(price) || price <= 0 || price > 5000) return json(res, 400, { error: 'Enter a valid route, vehicle, and fare.' });
+    const rideType = db.prepare('SELECT id, seats, base_fare AS baseFare FROM ride_types WHERE id = ?').get(rideTypeId);
+    if (!rideType) return json(res, 404, { error: 'Ride type not found.' });
+    ensureFareRules(rideType);
+    db.prepare('UPDATE fare_rules SET price = ? WHERE route_key = ? AND ride_type_id = ?').run(price, routeKey, rideTypeId);
+    if (routeKey === 'local') db.prepare('UPDATE ride_types SET base_fare = ? WHERE id = ?').run(price, rideTypeId);
+    return json(res, 200, { routeKey, rideTypeId, price });
   }
 
   if (req.method === 'POST' && pathname === '/api/admin/ride-types') {
@@ -252,6 +306,7 @@ async function handleApi(req, res, pathname) {
     try {
       const result = db.prepare('INSERT INTO ride_types (name, icon, seats, eta_minutes, base_fare, enabled) VALUES (?, ?, ?, ?, ?, 1)').run(name, icon, seats, etaMinutes, baseFare);
       const rideType = db.prepare('SELECT id, name, icon, seats, eta_minutes AS etaMinutes, base_fare AS baseFare, enabled FROM ride_types WHERE id = ?').get(result.lastInsertRowid);
+      ensureFareRules(rideType);
       return json(res, 201, { rideType });
     } catch { return json(res, 409, { error: 'A vehicle type with that name already exists.' }); }
   }
@@ -265,7 +320,9 @@ async function handleApi(req, res, pathname) {
     if (icon.length > 24 || !Number.isInteger(seats) || seats < 1 || seats > 30 || !Number.isInteger(etaMinutes) || etaMinutes < 1 || etaMinutes > 180 || !Number.isFinite(baseFare) || baseFare <= 0 || baseFare > 1000) return json(res, 400, { error: 'Enter valid ride type details.' });
     const result = db.prepare('UPDATE ride_types SET icon = ?, seats = ?, eta_minutes = ?, base_fare = ?, enabled = ? WHERE id = ?').run(icon, seats, etaMinutes, baseFare, enabled, Number(rideTypeMatch[1]));
     if (!result.changes) return json(res, 404, { error: 'Ride type not found.' });
+    db.prepare("UPDATE fare_rules SET price = ? WHERE route_key = 'local' AND ride_type_id = ?").run(baseFare, Number(rideTypeMatch[1]));
     const rideType = db.prepare('SELECT id, name, icon, seats, eta_minutes AS etaMinutes, base_fare AS baseFare, enabled FROM ride_types WHERE id = ?').get(Number(rideTypeMatch[1]));
+    ensureFareRules(rideType);
     return json(res, 200, { rideType });
   }
 
@@ -367,9 +424,9 @@ async function handleApi(req, res, pathname) {
       const destination = String(body.destination || '').trim().slice(0, 200);
       const rideType = String(body.rideType || '');
       if (!pickup || !destination) return json(res, 400, { error: 'Pickup and destination are required.' });
-      const selectedType = db.prepare('SELECT name, seats, base_fare AS baseFare FROM ride_types WHERE name = ? AND enabled = 1').get(rideType);
+      const selectedType = db.prepare('SELECT id, name, seats, base_fare AS baseFare FROM ride_types WHERE name = ? AND enabled = 1').get(rideType);
       if (!selectedType) return json(res, 400, { error: 'Choose an available ride type.' });
-      const quote = zoneFare(pickup, destination, selectedType.seats, selectedType.baseFare);
+      const quote = zoneFare(pickup, destination, selectedType.seats, selectedType.baseFare, selectedType.id);
       const result = db.prepare(`INSERT INTO rides (user_id, pickup, destination, ride_type, estimated_fare) VALUES (?, ?, ?, ?, ?)`).run(user.id, pickup, destination, rideType, quote.fare);
       const ride = db.prepare(`SELECT id, pickup, destination, ride_type AS rideType, estimated_fare AS estimatedFare, status, created_at AS createdAt FROM rides WHERE id = ?`).get(result.lastInsertRowid);
       return json(res, 201, { ride });

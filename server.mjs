@@ -76,6 +76,15 @@ db.exec(`
     price REAL NOT NULL CHECK (price > 0),
     PRIMARY KEY (route_key, ride_type_id)
   );
+  CREATE TABLE IF NOT EXISTS geofences (
+    zone TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    north REAL NOT NULL,
+    south REAL NOT NULL,
+    west REAL NOT NULL,
+    east REAL NOT NULL,
+    color TEXT NOT NULL
+  );
 `);
 
 if (!db.prepare("SELECT 1 FROM pragma_table_info('ride_types') WHERE name = 'icon'").get()) {
@@ -170,17 +179,23 @@ const fareRoutes = [
   ['airportPhase2', 'Airport (VIA) ↔ Hulhumalé Phase 2']
 ];
 
-const geofences = [
-  { zone: 'male', north: 4.189, south: 4.163, west: 73.496, east: 73.527 },
-  { zone: 'airport', north: 4.202, south: 4.183, west: 73.515, east: 73.550 },
-  { zone: 'phase1', north: 4.218, south: 4.202, west: 73.528, east: 73.563 },
-  { zone: 'phase2', north: 4.245, south: 4.218, west: 73.528, east: 73.568 }
+const geofenceDefaults = [
+  ['male', 'Malé', 4.189, 4.163, 73.496, 73.527, '#1f8bff'],
+  ['airport', 'Airport (VIA)', 4.202, 4.183, 73.515, 73.550, '#e56633'],
+  ['phase1', 'Hulhumalé Phase 1', 4.218, 4.202, 73.528, 73.563, '#18a67b'],
+  ['phase2', 'Hulhumalé Phase 2', 4.245, 4.218, 73.528, 73.568, '#8d5de8']
 ];
+const insertGeofence = db.prepare('INSERT OR IGNORE INTO geofences (zone, label, north, south, west, east, color) VALUES (?, ?, ?, ?, ?, ?, ?)');
+for (const geofence of geofenceDefaults) insertGeofence.run(...geofence);
+
+function currentGeofences() {
+  return db.prepare('SELECT zone, label, north, south, west, east, color FROM geofences ORDER BY CASE zone WHEN 'male' THEN 1 WHEN 'airport' THEN 2 WHEN 'phase1' THEN 3 WHEN 'phase2' THEN 4 ELSE 99 END').all();
+}
 
 function mapPointZone(latitude, longitude) {
   const lat = Number(latitude), lng = Number(longitude);
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
-  return geofences.find(area => lat <= area.north && lat >= area.south && lng >= area.west && lng <= area.east)?.zone || null;
+  return currentGeofences().find(area => lat <= area.north && lat >= area.south && lng >= area.west && lng <= area.east)?.zone || null;
 }
 
 function fareRouteKey(pickup, destination, pickupLat, pickupLng, destinationLat, destinationLng) {
@@ -268,7 +283,7 @@ async function handleApi(req, res, pathname) {
   }
 
   if (req.method === 'GET' && pathname === '/api/config') {
-    return json(res, 200, { googleMapsKey });
+    return json(res, 200, { googleMapsKey, geofences: currentGeofences() });
   }
 
   if (req.method === 'GET' && pathname === '/api/ride-types') {
@@ -292,6 +307,19 @@ async function handleApi(req, res, pathname) {
   if (req.method === 'GET' && pathname === '/api/admin/ride-types') {
     const rideTypes = db.prepare('SELECT id, name, icon, seats, eta_minutes AS etaMinutes, base_fare AS baseFare, enabled FROM ride_types ORDER BY id').all();
     return json(res, 200, { rideTypes });
+  }
+
+  if (req.method === 'GET' && pathname === '/api/admin/geofences') {
+    return json(res, 200, { geofences: currentGeofences() });
+  }
+
+  if (req.method === 'PATCH' && pathname === '/api/admin/geofences') {
+    const body = await getBody(req);
+    const zone = String(body.zone || '');
+    const north = Number(body.north), south = Number(body.south), west = Number(body.west), east = Number(body.east);
+    if (!geofenceDefaults.some(item => item[0] === zone) || ![north, south, west, east].every(Number.isFinite) || north <= south || east <= west || north < 4.1 || north > 4.3 || south < 4.1 || south > 4.3 || west < 73.4 || west > 73.7 || east < 73.4 || east > 73.7) return json(res, 400, { error: 'Enter valid Maldives geofence boundaries.' });
+    db.prepare('UPDATE geofences SET north = ?, south = ?, west = ?, east = ? WHERE zone = ?').run(north, south, west, east, zone);
+    return json(res, 200, { geofence: db.prepare('SELECT zone, label, north, south, west, east, color FROM geofences WHERE zone = ?').get(zone) });
   }
 
   if (req.method === 'GET' && pathname === '/api/admin/fare-rules') {

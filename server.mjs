@@ -198,6 +198,7 @@ function zoneFare(pickup, destination, seats, fallbackFare, rideTypeId) {
 }
 
 for (const rideType of db.prepare('SELECT id, seats, base_fare AS baseFare FROM ride_types').all()) ensureFareRules(rideType);
+db.prepare("UPDATE ride_types SET base_fare = (SELECT price FROM fare_rules WHERE fare_rules.ride_type_id = ride_types.id AND route_key = 'local') WHERE EXISTS (SELECT 1 FROM fare_rules WHERE fare_rules.ride_type_id = ride_types.id AND route_key = 'local')").run();
 
 function json(res, status, value) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });

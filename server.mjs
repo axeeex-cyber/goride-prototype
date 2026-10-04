@@ -433,6 +433,7 @@ async function handleApi(req, res, pathname) {
       const pickup = String(body.pickup || '').trim().slice(0, 200);
       const destination = String(body.destination || '').trim().slice(0, 200);
       const rideType = String(body.rideType || '');
+      const pickupLat = Number(body.pickupLat), destinationLat = Number(body.destinationLat);
       if (!pickup || !destination) return json(res, 400, { error: 'Pickup and destination are required.' });
       const selectedType = db.prepare('SELECT id, name, seats, base_fare AS baseFare FROM ride_types WHERE name = ? AND enabled = 1').get(rideType);
       if (!selectedType) return json(res, 400, { error: 'Choose an available ride type.' });

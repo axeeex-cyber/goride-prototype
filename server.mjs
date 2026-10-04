@@ -85,6 +85,26 @@ db.exec(`
     east REAL NOT NULL,
     color TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS driver_applications (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+    full_name TEXT NOT NULL,
+    national_id TEXT NOT NULL,
+    licence_number TEXT NOT NULL,
+    licence_expiry TEXT NOT NULL,
+    date_of_birth TEXT NOT NULL,
+    address TEXT NOT NULL,
+    vehicle_type TEXT NOT NULL,
+    vehicle_plate TEXT NOT NULL,
+    vehicle_color TEXT NOT NULL,
+    vehicle_year INTEGER NOT NULL,
+    profile_photo TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+    rejection_reason TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS driver_applications_status ON driver_applications(status, created_at DESC);
 `);
 
 if (!db.prepare("SELECT 1 FROM pragma_table_info('ride_types') WHERE name = 'icon'").get()) {
@@ -238,7 +258,7 @@ function getBody(req) {
     let data = '';
     req.on('data', chunk => {
       data += chunk;
-      if (data.length > 16_384) {
+      if (data.length > 3_200_000) {
         reject(new Error('Request body is too large'));
         req.destroy();
       }
@@ -433,6 +453,65 @@ async function handleApi(req, res, pathname) {
     return json(res, 200, { user });
   }
 
+  if (req.method === 'GET' && pathname === '/api/driver/application') {
+    const user = currentUser(req);
+    if (!user) return json(res, 401, { error: 'Sign in to continue.' });
+    const application = db.prepare(`SELECT id, full_name AS fullName, national_id AS nationalId, licence_number AS licenceNumber,
+      licence_expiry AS licenceExpiry, date_of_birth AS dateOfBirth, address, vehicle_type AS vehicleType,
+      vehicle_plate AS vehiclePlate, vehicle_color AS vehicleColor, vehicle_year AS vehicleYear, profile_photo AS profilePhoto,
+      status, rejection_reason AS rejectionReason, created_at AS createdAt FROM driver_applications WHERE user_id = ?`).get(user.id);
+    return json(res, 200, { application: application || null });
+  }
+
+  if (req.method === 'POST' && pathname === '/api/driver/application') {
+    const user = currentUser(req);
+    if (!user) return json(res, 401, { error: 'Sign in to continue.' });
+    const body = await getBody(req);
+    const fullName = String(body.fullName || '').trim().slice(0, 100);
+    const nationalId = String(body.nationalId || '').trim().slice(0, 40);
+    const licenceNumber = String(body.licenceNumber || '').trim().slice(0, 40);
+    const licenceExpiry = String(body.licenceExpiry || '').trim();
+    const dateOfBirth = String(body.dateOfBirth || '').trim();
+    const address = String(body.address || '').trim().slice(0, 240);
+    const vehicleType = String(body.vehicleType || '').trim().slice(0, 60);
+    const vehiclePlate = String(body.vehiclePlate || '').trim().toUpperCase().slice(0, 30);
+    const vehicleColor = String(body.vehicleColor || '').trim().slice(0, 40);
+    const vehicleYear = Number(body.vehicleYear);
+    const profilePhoto = String(body.profilePhoto || '');
+    const validPhoto = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(profilePhoto) && profilePhoto.length <= 3_000_000;
+    if (fullName.length < 3 || nationalId.length < 4 || licenceNumber.length < 4 || !/^\d{4}-\d{2}-\d{2}$/.test(licenceExpiry) || !/^\d{4}-\d{2}-\d{2}$/.test(dateOfBirth) || address.length < 4 || vehicleType.length < 2 || vehiclePlate.length < 2 || vehicleColor.length < 2 || !Number.isInteger(vehicleYear) || vehicleYear < 1980 || vehicleYear > new Date().getFullYear() + 1 || !validPhoto) return json(res, 400, { error: 'Complete every driver detail and upload a valid photo.' });
+    const existing = db.prepare('SELECT id, status FROM driver_applications WHERE user_id = ?').get(user.id);
+    if (existing?.status === 'approved') return json(res, 409, { error: 'This driver account is already approved.' });
+    if (existing) {
+      db.prepare(`UPDATE driver_applications SET full_name=?, national_id=?, licence_number=?, licence_expiry=?, date_of_birth=?, address=?, vehicle_type=?, vehicle_plate=?, vehicle_color=?, vehicle_year=?, profile_photo=?, status='pending', rejection_reason=NULL, updated_at=datetime('now') WHERE user_id=?`).run(fullName,nationalId,licenceNumber,licenceExpiry,dateOfBirth,address,vehicleType,vehiclePlate,vehicleColor,vehicleYear,profilePhoto,user.id);
+    } else {
+      db.prepare(`INSERT INTO driver_applications (user_id, full_name, national_id, licence_number, licence_expiry, date_of_birth, address, vehicle_type, vehicle_plate, vehicle_color, vehicle_year, profile_photo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(user.id,fullName,nationalId,licenceNumber,licenceExpiry,dateOfBirth,address,vehicleType,vehiclePlate,vehicleColor,vehicleYear,profilePhoto);
+    }
+    const application = db.prepare('SELECT id, status, created_at AS createdAt FROM driver_applications WHERE user_id = ?').get(user.id);
+    return json(res, 201, { application });
+  }
+
+  if (req.method === 'GET' && pathname === '/api/admin/drivers') {
+    const drivers = db.prepare(`SELECT driver_applications.id, users.phone, full_name AS fullName, national_id AS nationalId,
+      licence_number AS licenceNumber, licence_expiry AS licenceExpiry, date_of_birth AS dateOfBirth, address,
+      vehicle_type AS vehicleType, vehicle_plate AS vehiclePlate, vehicle_color AS vehicleColor, vehicle_year AS vehicleYear,
+      profile_photo AS profilePhoto, status, rejection_reason AS rejectionReason, created_at AS createdAt
+      FROM driver_applications JOIN users ON users.id = driver_applications.user_id ORDER BY CASE status WHEN 'pending' THEN 1 WHEN 'approved' THEN 2 ELSE 3 END, driver_applications.id DESC`).all();
+    return json(res, 200, { drivers });
+  }
+
+  const adminDriverMatch = pathname.match(/^\/api\/admin\/drivers\/(\d+)$/);
+  if (req.method === 'PATCH' && adminDriverMatch) {
+    const body = await getBody(req);
+    const status = String(body.status || '');
+    const rejectionReason = String(body.rejectionReason || '').trim().slice(0, 240);
+    if (!new Set(['pending', 'approved', 'rejected']).has(status)) return json(res, 400, { error: 'Choose a valid driver status.' });
+    if (status === 'rejected' && !rejectionReason) return json(res, 400, { error: 'Add a reason when rejecting a driver.' });
+    const result = db.prepare(`UPDATE driver_applications SET status=?, rejection_reason=?, updated_at=datetime('now') WHERE id=?`).run(status, status === 'rejected' ? rejectionReason : null, Number(adminDriverMatch[1]));
+    if (!result.changes) return json(res, 404, { error: 'Driver application not found.' });
+    return json(res, 200, { ok: true });
+  }
+
   if (req.method === 'GET' && pathname === '/api/admin/dashboard') {
     const customers = db.prepare('SELECT COUNT(*) AS count FROM users').get().count;
     const rideCount = db.prepare('SELECT COUNT(*) AS count FROM rides').get().count;
@@ -512,7 +591,7 @@ async function handle(req, res) {
     }
   }
   if (req.method !== 'GET' && req.method !== 'HEAD') return json(res, 405, { error: 'Method not allowed.' });
-  const requested = pathname === '/' ? '/index.html' : pathname === '/admin' ? '/admin.html' : decodeURIComponent(pathname);
+  const requested = pathname === '/' ? '/index.html' : pathname === '/admin' ? '/admin.html' : pathname === '/driver' ? '/driver.html' : decodeURIComponent(pathname);
   const relative = normalize(requested).replace(/^([/\\]|\.\.(?:[/\\]|$))+/, '');
   if (relative.split(/[\\/]/).some(segment => segment.startsWith('.'))) return json(res, 404, { error: 'Not found.' });
   const file = join(root, relative);

@@ -491,6 +491,30 @@ async function handleApi(req, res, pathname) {
     return json(res, 201, { application });
   }
 
+  if (req.method === 'POST' && pathname === '/api/admin/drivers') {
+    const body = await getBody(req);
+    const phone = String(body.phone || '').trim();
+    const fullName = String(body.fullName || '').trim().slice(0, 100);
+    const nationalId = String(body.nationalId || '').trim().slice(0, 40);
+    const licenceNumber = String(body.licenceNumber || '').trim().slice(0, 40);
+    const licenceExpiry = String(body.licenceExpiry || '').trim();
+    const dateOfBirth = String(body.dateOfBirth || '').trim();
+    const address = String(body.address || '').trim().slice(0, 240);
+    const vehicleType = String(body.vehicleType || '').trim().slice(0, 60);
+    const vehiclePlate = String(body.vehiclePlate || '').trim().toUpperCase().slice(0, 30);
+    const vehicleColor = String(body.vehicleColor || '').trim().slice(0, 40);
+    const vehicleYear = Number(body.vehicleYear);
+    const profilePhoto = String(body.profilePhoto || '');
+    const status = String(body.status || 'approved');
+    const validPhoto = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(profilePhoto) && profilePhoto.length <= 3_000_000;
+    if (!/^\d{7}$/.test(phone) || fullName.length < 3 || nationalId.length < 4 || licenceNumber.length < 4 || !/^\d{4}-\d{2}-\d{2}$/.test(licenceExpiry) || !/^\d{4}-\d{2}-\d{2}$/.test(dateOfBirth) || address.length < 4 || vehicleType.length < 2 || vehiclePlate.length < 2 || vehicleColor.length < 2 || !Number.isInteger(vehicleYear) || vehicleYear < 1980 || vehicleYear > new Date().getFullYear() + 1 || !validPhoto || !new Set(['pending','approved']).has(status)) return json(res, 400, { error: 'Complete every driver detail, phone number, and photo.' });
+    const user = db.prepare(`INSERT INTO users (phone) VALUES (?) ON CONFLICT(phone) DO UPDATE SET phone=excluded.phone RETURNING id`).get(phone);
+    const exists = db.prepare('SELECT id FROM driver_applications WHERE user_id = ?').get(user.id);
+    if (exists) return json(res, 409, { error: 'This phone number already has a driver application.' });
+    const result = db.prepare(`INSERT INTO driver_applications (user_id, full_name, national_id, licence_number, licence_expiry, date_of_birth, address, vehicle_type, vehicle_plate, vehicle_color, vehicle_year, profile_photo, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(user.id,fullName,nationalId,licenceNumber,licenceExpiry,dateOfBirth,address,vehicleType,vehiclePlate,vehicleColor,vehicleYear,profilePhoto,status);
+    return json(res, 201, { id: Number(result.lastInsertRowid) });
+  }
+
   if (req.method === 'GET' && pathname === '/api/admin/drivers') {
     const drivers = db.prepare(`SELECT driver_applications.id, users.phone, full_name AS fullName, national_id AS nationalId,
       licence_number AS licenceNumber, licence_expiry AS licenceExpiry, date_of_birth AS dateOfBirth, address,

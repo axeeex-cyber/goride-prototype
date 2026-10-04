@@ -113,9 +113,10 @@ const places = [
 const insertPlace = db.prepare('INSERT OR IGNORE INTO places (name, area, latitude, longitude) VALUES (?, ?, ?, ?)');
 for (const place of places) insertPlace.run(...place);
 const insertRideType = db.prepare('INSERT OR IGNORE INTO ride_types (name, icon, seats, eta_minutes, base_fare, enabled) VALUES (?, ?, ?, ?, ?, ?)');
-insertRideType.run('GoRide', '🚗', 4, 4, 8.4, 1);
-insertRideType.run('GoRide XL', '🚙', 6, 7, 12.6, 1);
+insertRideType.run('GoRide', '🚗', 4, 4, 30, 1);
+insertRideType.run('GoRide XL', '🚙', 6, 7, 30, 1);
 db.prepare("UPDATE ride_types SET icon = '🚙' WHERE name = 'GoRide XL' AND icon = '🚗'").run();
+db.prepare("UPDATE ride_types SET base_fare = 30 WHERE name IN ('GoRide', 'GoRide XL')").run();
 
 const port = Number(process.env.PORT || 3000);
 const mode = process.env.NODE_ENV || 'development';
@@ -126,6 +127,44 @@ if (mode === 'production' && (!process.env.OTP_SECRET || process.env.OTP_SECRET.
 const otpLifetimeMs = 5 * 60 * 1000;
 const sessionLifetimeMs = 30 * 24 * 60 * 60 * 1000;
 const requestLog = new Map();
+
+// Maldives taxi fares are set by the travel zones, rather than by distance.
+// Vehicle types with up to six seats use the standard column; 7–10 seats use
+// the larger-vehicle column.
+const fareTable = {
+  local: [30, 45],
+  malePhase1: [85, 125],
+  malePhase2: [100, 155],
+  phase1Phase2: [40, 60],
+  airportMale: [70, 105],
+  airportPhase1: [80, 120],
+  airportPhase2: [85, 130]
+};
+
+function normalizePlaceName(value) {
+  return String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+}
+
+function fareZone(value) {
+  const name = normalizePlaceName(value);
+  if (/(velana|via\b|airport|hulhule)/.test(name)) return 'airport';
+  if (/(phase\s*2|phase\s*ii|phase2|hulhumale.*2)/.test(name)) return 'phase2';
+  if (/(hulhumale|phase\s*1|phase\s*i\b|phase1)/.test(name)) return 'phase1';
+  if (/(male|male'|male\b|male city)/.test(name)) return 'male';
+  return 'local';
+}
+
+function zoneFare(pickup, destination, seats, fallbackFare) {
+  const from = fareZone(pickup), to = fareZone(destination);
+  const pair = new Set([from, to]);
+  let key = 'local';
+  if (pair.has('airport')) key = pair.has('male') ? 'airportMale' : pair.has('phase2') ? 'airportPhase2' : pair.has('phase1') ? 'airportPhase1' : 'local';
+  else if (pair.has('male') && pair.has('phase2')) key = 'malePhase2';
+  else if (pair.has('male') && pair.has('phase1')) key = 'malePhase1';
+  else if (pair.has('phase1') && pair.has('phase2')) key = 'phase1Phase2';
+  const column = Number(seats) >= 7 ? 1 : 0;
+  return { fare: fareTable[key]?.[column] ?? fallbackFare, zone: key };
+}
 
 function json(res, status, value) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
@@ -188,6 +227,16 @@ async function handleApi(req, res, pathname) {
   if (req.method === 'GET' && pathname === '/api/ride-types') {
     const rideTypes = db.prepare('SELECT id, name, icon, seats, eta_minutes AS etaMinutes, base_fare AS baseFare FROM ride_types WHERE enabled = 1 ORDER BY id').all();
     return json(res, 200, { rideTypes });
+  }
+
+  if (req.method === 'GET' && pathname === '/api/fare-quote') {
+    const params = new URL(req.url, `http://${req.headers.host || 'localhost'}`).searchParams;
+    const pickup = String(params.get('pickup') || '').trim();
+    const destination = String(params.get('destination') || '').trim();
+    const seats = Number(params.get('seats'));
+    if (!pickup || !destination || !Number.isInteger(seats)) return json(res, 400, { error: 'Pickup, destination, and vehicle seats are required.' });
+    const quote = zoneFare(pickup, destination, seats, seats >= 7 ? 45 : 30);
+    return json(res, 200, quote);
   }
 
   if (req.method === 'GET' && pathname === '/api/admin/ride-types') {
@@ -318,9 +367,10 @@ async function handleApi(req, res, pathname) {
       const destination = String(body.destination || '').trim().slice(0, 200);
       const rideType = String(body.rideType || '');
       if (!pickup || !destination) return json(res, 400, { error: 'Pickup and destination are required.' });
-      const selectedType = db.prepare('SELECT name, base_fare AS baseFare FROM ride_types WHERE name = ? AND enabled = 1').get(rideType);
+      const selectedType = db.prepare('SELECT name, seats, base_fare AS baseFare FROM ride_types WHERE name = ? AND enabled = 1').get(rideType);
       if (!selectedType) return json(res, 400, { error: 'Choose an available ride type.' });
-      const result = db.prepare(`INSERT INTO rides (user_id, pickup, destination, ride_type, estimated_fare) VALUES (?, ?, ?, ?, ?)`).run(user.id, pickup, destination, rideType, selectedType.baseFare);
+      const quote = zoneFare(pickup, destination, selectedType.seats, selectedType.baseFare);
+      const result = db.prepare(`INSERT INTO rides (user_id, pickup, destination, ride_type, estimated_fare) VALUES (?, ?, ?, ?, ?)`).run(user.id, pickup, destination, rideType, quote.fare);
       const ride = db.prepare(`SELECT id, pickup, destination, ride_type AS rideType, estimated_fare AS estimatedFare, status, created_at AS createdAt FROM rides WHERE id = ?`).get(result.lastInsertRowid);
       return json(res, 201, { ride });
     }

@@ -170,16 +170,21 @@ const fareRoutes = [
   ['airportPhase2', 'Airport (VIA) ↔ Hulhumalé Phase 2']
 ];
 
-function mapPointZone(latitude) {
-  const lat = Number(latitude);
-  if (!Number.isFinite(lat)) return null;
-  if (lat >= 4.218 && lat <= 4.245) return 'phase2';
-  if (lat >= 4.202 && lat < 4.218) return 'phase1';
-  return null;
+const geofences = [
+  { zone: 'male', north: 4.189, south: 4.163, west: 73.496, east: 73.527 },
+  { zone: 'airport', north: 4.202, south: 4.183, west: 73.515, east: 73.550 },
+  { zone: 'phase1', north: 4.218, south: 4.202, west: 73.528, east: 73.563 },
+  { zone: 'phase2', north: 4.245, south: 4.218, west: 73.528, east: 73.568 }
+];
+
+function mapPointZone(latitude, longitude) {
+  const lat = Number(latitude), lng = Number(longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  return geofences.find(area => lat <= area.north && lat >= area.south && lng >= area.west && lng <= area.east)?.zone || null;
 }
 
-function fareRouteKey(pickup, destination, pickupLat, destinationLat) {
-  const from = mapPointZone(pickupLat) || fareZone(pickup), to = mapPointZone(destinationLat) || fareZone(destination);
+function fareRouteKey(pickup, destination, pickupLat, pickupLng, destinationLat, destinationLng) {
+  const from = mapPointZone(pickupLat, pickupLng) || fareZone(pickup), to = mapPointZone(destinationLat, destinationLng) || fareZone(destination);
   const pair = new Set([from, to]);
   if (pair.has('airport')) return pair.has('male') ? 'airportMale' : pair.has('phase2') ? 'airportPhase2' : pair.has('phase1') ? 'airportPhase1' : 'local';
   if (pair.has('male') && pair.has('phase2')) return 'malePhase2';
@@ -199,8 +204,8 @@ function ensureFareRules(rideType) {
   for (const [routeKey] of fareRoutes) insert.run(routeKey, rideType.id, defaultFare(routeKey, rideType.seats, rideType.baseFare));
 }
 
-function zoneFare(pickup, destination, seats, fallbackFare, rideTypeId, pickupLat, destinationLat) {
-  const zone = fareRouteKey(pickup, destination, pickupLat, destinationLat);
+function zoneFare(pickup, destination, seats, fallbackFare, rideTypeId, pickupLat, pickupLng, destinationLat, destinationLng) {
+  const zone = fareRouteKey(pickup, destination, pickupLat, pickupLng, destinationLat, destinationLng);
   const saved = Number.isInteger(Number(rideTypeId)) ? db.prepare('SELECT price FROM fare_rules WHERE route_key = ? AND ride_type_id = ?').get(zone, Number(rideTypeId)) : null;
   return { fare: saved?.price ?? defaultFare(zone, seats, fallbackFare), zone };
 }
@@ -277,9 +282,10 @@ async function handleApi(req, res, pathname) {
     const destination = String(params.get('destination') || '').trim();
     const seats = Number(params.get('seats'));
     const rideTypeId = Number(params.get('rideTypeId'));
-    const pickupLat = Number(params.get('pickupLat')), destinationLat = Number(params.get('destinationLat'));
+    const pickupLat = Number(params.get('pickupLat')), pickupLng = Number(params.get('pickupLng'));
+    const destinationLat = Number(params.get('destinationLat')), destinationLng = Number(params.get('destinationLng'));
     if (!pickup || !destination || !Number.isInteger(seats)) return json(res, 400, { error: 'Pickup, destination, and vehicle seats are required.' });
-    const quote = zoneFare(pickup, destination, seats, seats >= 7 ? 45 : 30, Number.isInteger(rideTypeId) ? rideTypeId : undefined, pickupLat, destinationLat);
+    const quote = zoneFare(pickup, destination, seats, seats >= 7 ? 45 : 30, Number.isInteger(rideTypeId) ? rideTypeId : undefined, pickupLat, pickupLng, destinationLat, destinationLng);
     return json(res, 200, quote);
   }
 
@@ -433,11 +439,12 @@ async function handleApi(req, res, pathname) {
       const pickup = String(body.pickup || '').trim().slice(0, 200);
       const destination = String(body.destination || '').trim().slice(0, 200);
       const rideType = String(body.rideType || '');
-      const pickupLat = Number(body.pickupLat), destinationLat = Number(body.destinationLat);
+      const pickupLat = Number(body.pickupLat), pickupLng = Number(body.pickupLng);
+      const destinationLat = Number(body.destinationLat), destinationLng = Number(body.destinationLng);
       if (!pickup || !destination) return json(res, 400, { error: 'Pickup and destination are required.' });
       const selectedType = db.prepare('SELECT id, name, seats, base_fare AS baseFare FROM ride_types WHERE name = ? AND enabled = 1').get(rideType);
       if (!selectedType) return json(res, 400, { error: 'Choose an available ride type.' });
-      const quote = zoneFare(pickup, destination, selectedType.seats, selectedType.baseFare, selectedType.id, pickupLat, destinationLat);
+      const quote = zoneFare(pickup, destination, selectedType.seats, selectedType.baseFare, selectedType.id, pickupLat, pickupLng, destinationLat, destinationLng);
       const result = db.prepare(`INSERT INTO rides (user_id, pickup, destination, ride_type, estimated_fare) VALUES (?, ?, ?, ?, ?)`).run(user.id, pickup, destination, rideType, quote.fare);
       const ride = db.prepare(`SELECT id, pickup, destination, ride_type AS rideType, estimated_fare AS estimatedFare, status, created_at AS createdAt FROM rides WHERE id = ?`).get(result.lastInsertRowid);
       return json(res, 201, { ride });

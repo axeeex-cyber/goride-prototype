@@ -2,3 +2,7 @@ data/*.sqlite
 data/*.sqlite-shm
 data/*.sqlite-wal
 .env
+
+firebase-service-account.json
+
+node_modules/

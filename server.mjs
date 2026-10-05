@@ -4,6 +4,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { readFile, mkdir } from 'node:fs/promises';
 import { dirname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { cert, getApps, initializeApp } from 'firebase-admin/app';
+import { getMessaging } from 'firebase-admin/messaging';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const dataDir = join(root, 'data');
@@ -105,6 +107,15 @@ db.exec(`
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
   CREATE INDEX IF NOT EXISTS driver_applications_status ON driver_applications(status, created_at DESC);
+  CREATE TABLE IF NOT EXISTS driver_devices (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    platform TEXT NOT NULL CHECK (platform IN ('android', 'ios')),
+    fcm_token TEXT NOT NULL UNIQUE,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(user_id, platform)
+  );
+  CREATE INDEX IF NOT EXISTS driver_devices_user ON driver_devices(user_id);
 `);
 
 if (!db.prepare("SELECT 1 FROM pragma_table_info('ride_types') WHERE name = 'icon'").get()) {
@@ -162,6 +173,50 @@ if (mode === 'production' && (!process.env.OTP_SECRET || process.env.OTP_SECRET.
 const otpLifetimeMs = 5 * 60 * 1000;
 const sessionLifetimeMs = 30 * 24 * 60 * 60 * 1000;
 const requestLog = new Map();
+let firebaseMessaging = null;
+
+async function messagingClient() {
+  if (firebaseMessaging) return firebaseMessaging;
+  let raw = process.env.FIREBASE_SERVICE_ACCOUNT || '';
+  if (!raw) {
+    try { raw = await readFile(join(root, 'firebase-service-account.json'), 'utf8'); } catch {}
+  }
+  if (!raw) return null;
+  try {
+    const serviceAccount = JSON.parse(raw);
+    const app = getApps()[0] || initializeApp({ credential: cert(serviceAccount) });
+    firebaseMessaging = getMessaging(app);
+    return firebaseMessaging;
+  } catch (error) {
+    console.error('Firebase notification configuration is invalid:', error.message);
+    return null;
+  }
+}
+
+async function notifyApprovedDrivers(ride) {
+  const messaging = await messagingClient();
+  if (!messaging) return { delivered: 0, configured: false };
+  const tokens = db.prepare(`SELECT driver_devices.fcm_token AS token FROM driver_devices
+    JOIN driver_applications ON driver_applications.user_id = driver_devices.user_id
+    WHERE driver_applications.status = 'approved'`).all().map(item => item.token);
+  if (!tokens.length) return { delivered: 0, configured: true };
+  const response = await messaging.sendEachForMulticast({
+    tokens,
+    notification: { title: 'New GoRide request', body: `${ride.pickup} → ${ride.destination}` },
+    data: { type: 'ride_request', rideId: String(ride.id), pickup: ride.pickup, destination: ride.destination, fare: String(ride.estimatedFare) },
+    android: { priority: 'high', notification: { channelId: 'ride_requests', sound: 'default' } },
+    apns: { payload: { aps: { sound: 'default', contentAvailable: true } } }
+  });
+  const invalid = [];
+  response.responses.forEach((result, index) => {
+    if (!result.success && ['messaging/registration-token-not-registered', 'messaging/invalid-registration-token'].includes(result.error?.code)) invalid.push(tokens[index]);
+  });
+  if (invalid.length) {
+    const remove = db.prepare('DELETE FROM driver_devices WHERE fcm_token = ?');
+    for (const token of invalid) remove.run(token);
+  }
+  return { delivered: response.successCount, configured: true };
+}
 
 // Maldives taxi fares are set by the travel zones, rather than by distance.
 // Vehicle types with up to six seats use the standard column; 7–10 seats use
@@ -453,6 +508,20 @@ async function handleApi(req, res, pathname) {
     return json(res, 200, { user });
   }
 
+  if (req.method === 'POST' && pathname === '/api/driver/device-token') {
+    const user = currentUser(req);
+    if (!user) return json(res, 401, { error: 'Sign in as a driver first.' });
+    const approved = db.prepare("SELECT 1 FROM driver_applications WHERE user_id = ? AND status = 'approved'").get(user.id);
+    if (!approved) return json(res, 403, { error: 'Your driver account must be approved first.' });
+    const body = await getBody(req);
+    const platform = String(body.platform || '');
+    const token = String(body.token || '').trim();
+    if (!['android', 'ios'].includes(platform) || token.length < 40 || token.length > 4096) return json(res, 400, { error: 'Enter a valid device notification token.' });
+    db.prepare(`INSERT INTO driver_devices (user_id, platform, fcm_token, updated_at) VALUES (?, ?, ?, datetime('now'))
+      ON CONFLICT(user_id, platform) DO UPDATE SET fcm_token = excluded.fcm_token, updated_at = datetime('now')`).run(user.id, platform, token);
+    return json(res, 200, { ok: true });
+  }
+
   if (req.method === 'GET' && pathname === '/api/driver/application') {
     const user = currentUser(req);
     if (!user) return json(res, 401, { error: 'Sign in to continue.' });
@@ -578,7 +647,10 @@ async function handleApi(req, res, pathname) {
       const quote = zoneFare(pickup, destination, selectedType.seats, selectedType.baseFare, selectedType.id, pickupLat, pickupLng, destinationLat, destinationLng);
       const result = db.prepare(`INSERT INTO rides (user_id, pickup, destination, ride_type, estimated_fare) VALUES (?, ?, ?, ?, ?)`).run(user.id, pickup, destination, rideType, quote.fare);
       const ride = db.prepare(`SELECT id, pickup, destination, ride_type AS rideType, estimated_fare AS estimatedFare, status, created_at AS createdAt FROM rides WHERE id = ?`).get(result.lastInsertRowid);
-      return json(res, 201, { ride });
+      let notifications = { delivered: 0, configured: false };
+      try { notifications = await notifyApprovedDrivers(ride); }
+      catch (error) { console.error('Ride notification could not be sent:', error.message); }
+      return json(res, 201, { ride, notifications });
     }
   }
   return json(res, 404, { error: 'API route not found.' });
